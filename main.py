@@ -9,7 +9,8 @@ from integrations.hydraai import TextAI
 import openpyxl
 import pdfplumber
 from aiogram.filters import Command
-from utils import extract_system_subscriptions, make_subscriptions_keyboard
+import json
+from utils import make_subscriptions_keyboard
 
 dp = Dispatcher()
 
@@ -82,7 +83,7 @@ async def pdf_handler(message: types.Message):
     with open('prompt.txt', 'r', encoding='utf-8') as f:
         prompt = f.read()
 
-    # Логируем пдф-контент
+    # Логируем
     os.makedirs('logs', exist_ok=True)
     logging.basicConfig(
        filename='logs/pdf_extract.log',
@@ -91,7 +92,6 @@ async def pdf_handler(message: types.Message):
        level=logging.INFO,
        encoding='utf-8'
     )
-    logging.info("PDF text extracted:\n%s", pdf_text)
 
     # Собираем промпт для нейросети
     messages = [
@@ -109,17 +109,27 @@ async def pdf_handler(message: types.Message):
     except:
         pass
 
-    user_text, subscriptions = extract_system_subscriptions(answer.answer)
-    if subscriptions:
-        keyboard = make_subscriptions_keyboard(subscriptions)
-    else:
-        keyboard = None
+    answer = answer.answer
+    try:
+        data = json.loads(answer)
+    except json.JSONDecodeError as e:
+        return await message.answer(f"Ошибка разбора JSON: {e}")
+
+    user_message = data['text']
+    # user_message = data['hi'] + "\n\n"
+    # for sub in data['subs']:
+    #     user_message += sub['text'] + "\n"
+    # user_message += "\n" + data['end']
+
+    logging.info("User Message:\n%s", user_message)
+
+    keyboard = make_subscriptions_keyboard(data['names'])
 
     try:
         await bot.send_rich_message(
             chat_id=message.chat.id,
             rich_message=types.InputRichMessage(
-                markdown=user_text
+                markdown=user_message
             ),
             reply_markup=keyboard
         )
@@ -127,7 +137,7 @@ async def pdf_handler(message: types.Message):
         await bot.send_rich_message(
             chat_id=message.chat.id,
             rich_message=types.InputRichMessage(
-                html=user_text
+                html=user_message
             ),
             reply_markup=keyboard
         )
@@ -153,6 +163,10 @@ async def message_handler(message: types.Message):
     # except:
     #     await bot.send_rich_message(chat_id=message.chat.id, rich_message=types.InputRichMessage(html=answer.answer))
 
+@dp.callback_query(lambda c: c.data.startswith("subscription:"))
+async def on_subscription_click(callback_query: types.CallbackQuery):
+    subscription_name = callback_query.data.split(":", 1)[1]
+    await callback_query.answer(f"Вы выбрали: {subscription_name}")
 
 @dp.shutdown()
 async def on_shutdown():
