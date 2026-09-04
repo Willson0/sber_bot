@@ -3,9 +3,13 @@ from aiogram import Dispatcher, types, F
 from bot import bot
 import datetime
 import io
+import os
+import logging
 from integrations.hydraai import TextAI
 import openpyxl
-import PyPDF2
+import pdfplumber
+from aiogram.filters import Command
+from utils import extract_system_subscriptions, make_subscriptions_keyboard
 
 dp = Dispatcher()
 
@@ -32,6 +36,12 @@ async def startup():
         f"===============================================================\n"
     )
 
+@dp.message(Command("start"))
+async def start_command_handler(message: types.Message):
+    with open('start_message.txt', 'r', encoding='utf-8') as f:
+        start = f.read()
+    await bot.send_rich_message(chat_id=message.chat.id, rich_message=types.InputRichMessage(markdown=start, parse_mode="Markdown"))
+
 @dp.message(F.document)
 async def pdf_handler(message: types.Message):
     document = message.document
@@ -51,27 +61,46 @@ async def pdf_handler(message: types.Message):
         file_bytes.seek(0)
         file_content = file_bytes
 
+
     # Читаем PDF и превращаем в текст
-    try:
-        reader = PyPDF2.PdfReader(file_content)
-        pdf_text = ""
-        for page in reader.pages:
-            pdf_text += page.extract_text() or ""
-        if not pdf_text.strip():
-            await message.reply("Не удалось извлечь текст из PDF-файла.")
-            return
-    except Exception as e:
-        await message.reply(f"Ошибка чтения PDF: {e}")
-        return
+    pdf_text = ""
+    with pdfplumber.open(file_content) as pdf:
+      for page in pdf.pages:
+          # Если страница содержит таблицу:
+          tables = page.extract_tables()
+          for table in tables:
+              for row in table:
+                  pdf_text += "\t".join(str(cell) for cell in row) + "\n"
+          # Если нет таблиц, просто текст:
+          if not tables:
+              pdf_text += page.extract_text() or ""
+    # except Exception as e:
+    #     await message.reply(f"Ошибка чтения PDF: {e}")
+    #     return
+
+    # Читаем системный промпт
+    with open('prompt.txt', 'r', encoding='utf-8') as f:
+        prompt = f.read()
+
+    # Логируем пдф-контент
+    os.makedirs('logs', exist_ok=True)
+    logging.basicConfig(
+       filename='logs/pdf_extract.log',
+       filemode='a',
+       format='%(asctime)s | %(levelname)s | %(message)s',
+       level=logging.INFO,
+       encoding='utf-8'
+    )
+    logging.info("PDF text extracted:\n%s", pdf_text)
 
     # Собираем промпт для нейросети
     messages = [
-        {'role': 'system', 'content': 'Используй Latex формулы при необходимости (ОБЕРНУТЬ LATEX В $ или $$) и MarkDown. Данные получены из PDF-файла.'},
+        {'role': 'system', 'content': prompt},
         {'role': 'user', 'content': pdf_text}
     ]
 
     mes = await message.answer("Генерирую ответ по вашему PDF...")
-    answer = await TextAI.from_text(messages=messages, model='gpt-4o-mini')
+    answer = await TextAI.from_text(messages=messages, model='gpt-5.6-terra')
     if answer.error_text:
         return await message.answer(f"ОШИБКА: {answer.error_text}")
 
@@ -80,10 +109,28 @@ async def pdf_handler(message: types.Message):
     except:
         pass
 
+    user_text, subscriptions = extract_system_subscriptions(answer.answer)
+    if subscriptions:
+        keyboard = make_subscriptions_keyboard(subscriptions)
+    else:
+        keyboard = None
+
     try:
-        await bot.send_rich_message(chat_id=message.chat.id, rich_message=types.InputRichMessage(markdown=answer.answer))
-    except:
-        await bot.send_rich_message(chat_id=message.chat.id, rich_message=types.InputRichMessage(html=answer.answer))
+        await bot.send_rich_message(
+            chat_id=message.chat.id,
+            rich_message=types.InputRichMessage(
+                markdown=user_text
+            ),
+            reply_markup=keyboard
+        )
+    except Exception:
+        await bot.send_rich_message(
+            chat_id=message.chat.id,
+            rich_message=types.InputRichMessage(
+                html=user_text
+            ),
+            reply_markup=keyboard
+        )
 
 @dp.message(F.text)
 async def message_handler(message: types.Message):
