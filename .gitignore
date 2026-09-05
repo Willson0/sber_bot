@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Environment
+.env
+
+# Database
+*.db
+*.sqlite3
+
+# Uploads and data
+uploads/*
+data/*
+
+# But keep empty folders
+!uploads/.gitkeep
+!data/.gitkeep
+
+# IDE
+.idea/
+.vscode/
+# Local cloudflared binary
+cloudflared.exe
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Environment
+.env
+
+# Database
+*.db
+*.sqlite3
+
+# Uploads and data
+uploads/*
+data/*
+!uploads/.gitkeep
+!data/.gitkeep
+
+# IDE
+.idea/
+.vscode/

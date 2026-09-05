@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Сканер подписок</title>
+    <script src="/telegram-web-app.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 16px;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+            background: #f5f6f8;
+            color: #111;
+        }
+        .container { max-width: 560px; margin: 0 auto; }
+        .card {
+            background: #fff;
+            border-radius: 16px;
+            padding: 20px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.08);
+            margin-bottom: 16px;
+        }
+        h1 { font-size: 22px; margin: 0 0 8px; }
+        .badge {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 999px;
+            background: #eef3ff;
+            color: #2457ff;
+            font-size: 12px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+        .muted { color: #667085; font-size: 14px; line-height: 1.5; }
+        input[type="file"] { width: 100%; margin: 12px 0; font-size: 14px; }
+        .btn {
+            width: 100%;
+            border: none;
+            border-radius: 12px;
+            padding: 14px;
+            background: #2457ff;
+            color: #fff;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        #status { min-height: 20px; font-size: 14px; margin-top: 8px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <span class="badge">MVP</span>
+            <h1>Сканер подписок</h1>
+            <p id="greeting" class="muted">Загрузка…</p>
+        </div>
+
+        <div class="card">
+            <p class="muted">
+                Загрузите выписку по карте за последние 6 месяцев.
+                Поддерживаются форматы CSV и XLSX.
+            </p>
+            <input type="file" id="statement-file" accept=".csv,.xlsx,.xls">
+            <button id="analyze-btn" class="btn">Проанализировать</button>
+            <p id="status"></p>
+        </div>
+    </div>
+
+    <script>
+        // Внутри Telegram объект WebApp существует, в обычном браузере — нет
+        const tg = (window.Telegram && window.Telegram.WebApp) ? window.Telegram.WebApp : null;
+        if (tg) {
+            tg.ready();
+            tg.expand();
+        }
+
+        const user = tg && tg.initDataUnsafe ? tg.initDataUnsafe.user : null;
+        const greeting = document.getElementById("greeting");
+        if (user && user.first_name) {
+            greeting.textContent = "Привет, " + user.first_name + "! Найдём забытые подписки?";
+        } else {
+            greeting.textContent = "Привет! Это режим разработки в браузере (вне Telegram).";
+        }
+
+        const btn = document.getElementById("analyze-btn");
+        const status = document.getElementById("status");
+        const fileInput = document.getElementById("statement-file");
+
+        btn.addEventListener("click", () => {
+            if (!fileInput.files.length) {
+                status.textContent = "Сначала выберите файл выписки.";
+                return;
+            }
+            status.textContent = "Файл «" + fileInput.files[0].name + "» выбран. Сама загрузка появится на шаге 5.";
+        });
+    </script>
+</body>
+</html>
