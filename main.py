@@ -257,8 +257,23 @@ async def on_subscription_click(callback_query: types.CallbackQuery):
     if idx < len(cluster_indices):
         real_cluster_idx = cluster_indices[idx]
         if 0 <= real_cluster_idx < len(clusters):
+            matched_transactions = clusters[real_cluster_idx].get('transactions', [])
             periodicity = clusters[real_cluster_idx].get('periodicity') or {}
             cluster_period_type = periodicity.get('period_type')
+
+    # Фоллбэк для старых записей в БД (сохранённых до этого фикса,
+    # у них просто нет clusters/cluster_indices) — не ломаем старые кнопки.
+    if not matched_transactions:
+        logging.warning(
+            "cluster_indices не дали транзакций для '%s' (idx=%s), "
+            "использую fallback find_matching_transactions",
+            subscription_name, idx,
+        )
+        matched_transactions = find_matching_transactions(records, subscription_name)
+
+    logging.info(
+        "Matched transactions for '%s': %d", subscription_name, len(matched_transactions)
+    )
 
     stats = compute_subscription_stats(matched_transactions, cluster_period_type)
 
@@ -280,8 +295,6 @@ async def on_subscription_click(callback_query: types.CallbackQuery):
 
     prompt = prompt_template.replace("{SUBSCRIPTION_NAME}", subscription_name)
 
-    # LLM теперь получает ТОЛЬКО задачу написать письмо — никаких чисел,
-    # значит и ошибиться в арифметике негде.
     messages = [
         {'role': 'system', 'content': prompt},
         {'role': 'user', 'content': f"Напиши письмо для отмены подписки на {subscription_name}"},

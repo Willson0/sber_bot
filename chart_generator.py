@@ -21,21 +21,22 @@ def _parse_date(d: str):
 
 
 def compute_subscription_stats(transactions: list[dict], period_type: str | None = None) -> dict | None:
-    """
-    Считает статистику по списаниям подписки.
-    transactions — список dict с 'date' и 'amount'.
-    period_type — 'monthly'/'weekly'/'quarterly'/'yearly' (из cluster['periodicity']),
-                  если None — считаем как ежемесячную по умолчанию.
-    """
     points = []
+    skipped = 0
     for t in transactions:
         date = _parse_date(t.get('date', ''))
         amount = t.get('amount')
         if date is None or amount is None:
+            skipped += 1
             continue
         points.append((date, abs(amount)))
 
     if not points:
+        import logging
+        logging.warning(
+            "compute_subscription_stats: 0 валидных точек из %d транзакций, skipped=%d, raw=%s",
+            len(transactions), skipped, transactions,
+        )
         return None
 
     points.sort(key=lambda p: p[0])
