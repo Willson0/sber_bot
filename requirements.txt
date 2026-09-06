@@ -19,4 +19,6 @@ typing_extensions==4.16.0
 yarl==1.24.5
 openpyxl
 PyPDF2
-
+pdfplumber
+aiomysql
+rapidfuzz

@@ -1,5 +1,6 @@
 import re
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+from aiogram.types import WebAppInfo
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 import pdfplumber
 import json
 import io
@@ -22,24 +23,52 @@ import io
 #     return clean_text, subs_list
 
 
-def make_subscriptions_keyboard(subscriptions):
-    keyboard = []
-    # разбиваем список по 2 в строке
-    for i in range(0, len(subscriptions), 2):
-        row = [
-            InlineKeyboardButton(
-                text=sub,
-                callback_data=f"subscription:{sub}"
-            ) for sub in subscriptions[i:i+2]
-        ]
-        keyboard.append(row)
+# def make_subscriptions_keyboard(subscriptions: list[str], statement_id:id):
+#     keyboard = []
+#     # разбиваем список по 2 в строке
+#     for i in range(0, len(subscriptions), 2):
+#         row = [
+#             InlineKeyboardButton(
+#                 text=sub,
+#                 callback_data=f"sub:{statement_id}:{idx}"
+#             ) for sub in subscriptions[i:i+2]
+#         ]
+#         keyboard.append(row)
 
-    keyboard.append([
-        InlineKeyboardButton(
-            text="Открыть аналитику",
-            web_app=WebAppInfo(url="https://your-webapp-url.com/")
-        )])
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+#     keyboard.append([
+#         InlineKeyboardButton(
+#             text="Открыть аналитику",
+#             web_app=WebAppInfo(url="https://your-webapp-url.com/")
+#         )])
+#     return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+WEBAPP_URL = "https://later.com"
+
+def make_subscriptions_keyboard(names: list[str], statement_id: int):
+    builder = InlineKeyboardBuilder()
+
+    for idx, name in enumerate(names):
+        # компактный callback_data: sub:<id_выписки>:<индекс_подписки>
+        builder.button(text=name, callback_data=f"sub:{statement_id}:{idx}")
+
+    # Кнопка веб-аппа — отдельная, не участвует в раскладке "по 2 в строке"
+    builder.button(
+        text="📊 Открыть полную аналитику",
+        web_app=WebAppInfo(url=WEBAPP_URL),
+    )
+
+    # Раскладка: сначала N кнопок подписок по 2 в строке,
+    # последняя кнопка (веб-апп) — отдельной строкой на всю ширину.
+    if names:
+        rows = [2] * (len(names) // 2)
+        if len(names) % 2:
+            rows.append(1)
+        rows.append(1)  # строка под кнопку веб-аппа
+        builder.adjust(*rows)
+    else:
+        builder.adjust(1)
+
+    return builder.as_markup()
 
 TIME_RE = re.compile(r'^\d{2}:\d{2}$')
 DATE_RE = re.compile(r'^\d{2}\.\d{2}\.\d{4}$')

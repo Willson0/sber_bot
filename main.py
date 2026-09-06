@@ -7,13 +7,24 @@ import os
 import re
 import logging
 from integrations.hydraai import TextAI
-import openpyxl
-import pdfplumber
+from subscription_finder import build_llm_payload
 from aiogram.filters import Command
 import json
 from utils import make_subscriptions_keyboard, parse_statement
+from database import init_db, save_statement, get_statement, close_pool
+from llm_helpers import call_llm_with_retry, llm_failed
 
 dp = Dispatcher()
+
+os.makedirs('logs', exist_ok=True)
+logging.basicConfig(
+   filename='logs/pdf_extract.log',
+   filemode='a',
+   format='%(asctime)s | %(levelname)s | %(message)s',
+   level=logging.INFO,
+   encoding='utf-8'
+)
+
 
 async def main():
     cmds = [
@@ -22,8 +33,10 @@ async def main():
     await bot.set_my_commands(commands=cmds)
     await dp.start_polling(bot, allowed_updates=["message", 'callback_query'])
 
+
 @dp.startup()
 async def startup():
+    await init_db()
     me = await bot.get_me()
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(
@@ -38,11 +51,13 @@ async def startup():
         f"===============================================================\n"
     )
 
+
 @dp.message(Command("start"))
 async def start_command_handler(message: types.Message):
     with open('start_message.txt', 'r', encoding='utf-8') as f:
         start = f.read()
     await bot.send_rich_message(chat_id=message.chat.id, rich_message=types.InputRichMessage(markdown=start, parse_mode="Markdown"))
+
 
 def clean_record(r: dict) -> dict:
     """Универсальная очистка для обоих форматов (sber/tbank)"""
@@ -66,6 +81,7 @@ def clean_record(r: dict) -> dict:
         'desc': re.sub(r'\s+', ' ', r.get('desc', '')).strip(),
     }
 
+
 @dp.message(F.document)
 async def pdf_handler(message: types.Message):
     document = message.document
@@ -78,17 +94,13 @@ async def pdf_handler(message: types.Message):
     # Скачиваем файл
     file = await bot.get_file(document.file_id)
     file_bytes = await bot.download_file(file.file_path)
-    
-    # Гарантируем BytesIO
+
     if isinstance(file_bytes, bytes):
         file_content = io.BytesIO(file_bytes)
     else:
-        # если это file-like объект, перематываем и используем напрямую
         file_bytes.seek(0)
         file_content = file_bytes
 
-
-    # Читаем PDF и превращаем в текст
     try:
         bank, records = parse_statement(file_content)
     except Exception as e:
@@ -99,59 +111,121 @@ async def pdf_handler(message: types.Message):
         await mes.edit_text("Не удалось извлечь транзакции из PDF.")
         return
 
+    # records = [clean_record(r) for r in records]
+    # transactions_json = json.dumps(records, ensure_ascii=False, indent=2)
+
+    # content = f"{transactions_json}"
+
+    # with open('prompt.txt', 'r', encoding='utf-8') as f:
+    #     prompt = f.read()
+
+    # messages = [
+    #     {'role': 'system', 'content': prompt},
+    #     {'role': 'user', 'content': content}
+    # ]
+
+    # logging.info("PDF TEXT:\n%s", transactions_json)
+
+    # answer = await TextAI.from_text(messages=messages, model='gpt-5.6-terra')
+    # if answer.error_text:
+    #     return await message.answer(f"ОШИБКА: {answer.error_text}")
+
     records = [clean_record(r) for r in records]
-    transactions_json = json.dumps(records, ensure_ascii=False, indent=2)
 
-    content = f"{transactions_json}"
+    # ── Детерминированная предобработка: находим кластеры-кандидаты
+    # на подписку ДО того, как отдать что-либо LLM.
+    clusters = build_llm_payload(records)
 
-    # Читаем системный промпт
+    logging.info("Raw records: %d, clusters found: %d", len(records), len(clusters))
+
+    # Если алгоритм вообще не нашёл ни одного повтора/маркера — сразу
+    # отдаём финальный ответ без похода в LLM. Экономит время, деньги
+    # и полностью убирает шанс на "фантомную" подписку из воздуха.
+    if not clusters:
+        try:
+            await mes.delete()
+        except Exception:
+            pass
+        await bot.send_rich_message(
+            chat_id=message.chat.id,
+            rich_message=types.InputRichMessage(
+                markdown="Не нашел ни одну активную подписку!"
+            )
+        )
+        return
+
+    clusters_json = json.dumps(clusters, ensure_ascii=False, indent=2)
+
     with open('prompt.txt', 'r', encoding='utf-8') as f:
         prompt = f.read()
 
-    # Логируем
-    os.makedirs('logs', exist_ok=True)
-    logging.basicConfig(
-       filename='logs/pdf_extract.log',
-       filemode='a',
-       format='%(asctime)s | %(levelname)s | %(message)s',
-       level=logging.INFO,
-       encoding='utf-8'
-    )
-
-    # Собираем промпт для нейросети
     messages = [
         {'role': 'system', 'content': prompt},
-        {'role': 'user', 'content': content}
+        {'role': 'user', 'content': clusters_json}
     ]
 
-    logging.info("PDF TEXT:\n%s", transactions_json)
+    logging.info("Clusters sent to LLM:\n%s", clusters_json)
 
-    answer = await TextAI.from_text(messages=messages, model='gpt-5.6-terra')
-    if answer.error_text:
-        return await message.answer(f"ОШИБКА: {answer.error_text}")
+    # answer = await TextAI.from_text(messages=messages, model='gpt-5.6-terra')
+    # if answer.error_text:
+    #     return await message.answer(f"ОШИБКА: {answer.error_text}")
+
+
+    # try:
+    #     await mes.delete()
+    # except Exception:
+    #     pass
+
+    # answer_text = answer.answer
+    # logging.info("Answer:\n%s", answer_text)
+    # try:
+    #     data = json.loads(answer_text)
+    # except json.JSONDecodeError as e:
+    #     return await message.answer(f"Ошибка разбора JSON: {e}")
+
+    answer = await call_llm_with_retry(TextAI, messages, model='gpt-5.6-terra')
+
+    if llm_failed(answer):
+        logging.error(
+            "LLM request failed after retries. error_text=%r, answer=%r",
+            answer.error_text, answer.answer,
+        )
+        await mes.edit_text(
+            "⚠️ Сервис обработки временно перегружен. "
+            "Попробуйте отправить файл ещё раз через пару минут."
+        )
+        return
 
     try:
         await mes.delete()
-    except:
+    except Exception:
         pass
 
-    answer = answer.answer
-    logging.info("Answer:\n%s", answer)
+    answer_text = answer.answer
+    logging.info("Answer:\n%s", answer_text)
     try:
-        data = json.loads(answer)
+        data = json.loads(answer_text)
     except json.JSONDecodeError as e:
-        return await message.answer(f"Ошибка разбора JSON: {e}")
+        logging.error("JSON decode failed. Raw answer: %s", answer_text)
+        return await message.answer(
+            "⚠️ Не удалось обработать ответ сервиса. Попробуйте отправить файл ещё раз."
+        )
+
 
     user_message = data['text']
-    # user_message = data['hi'] + "\n\n"
-    # for sub in data['subs']:
-    #     user_message += sub['text'] + "\n"
-    # user_message += "\n" + data['end']
+    names = data['names']
 
+    logging.info("Subs:\n%s", names)
 
-    logging.info("Subs:\n%s", data['names'])
+    # Сохраняем выписку и список подписок в БД, получаем id записи
+    statement_id = await save_statement(
+        user_id=message.from_user.id,
+        chat_id=message.chat.id,
+        records=records,
+        names=names,
+    )
 
-    keyboard = make_subscriptions_keyboard(data['names'])
+    keyboard = make_subscriptions_keyboard(names, statement_id)
 
     try:
         await bot.send_rich_message(
@@ -170,25 +244,104 @@ async def pdf_handler(message: types.Message):
             reply_markup=keyboard
         )
 
+
 @dp.message(F.text)
 async def message_handler(message: types.Message):
     await bot.send_rich_message(chat_id=message.chat.id, rich_message=types.InputRichMessage(markdown="Отправьте файл формата .pdf для получения выписки!"))
 
-@dp.callback_query(lambda c: c.data.startswith("subscription:"))
+
+@dp.callback_query(lambda c: c.data.startswith("sub:"))
 async def on_subscription_click(callback_query: types.CallbackQuery):
-    subscription_name = callback_query.data.split(":", 1)[1]
     await callback_query.answer()
 
-    await bot.send_rich_message(chat_id=callback_query.message.chat.id, rich_message=types.InputRichMessage(html=f"""
-        Вы выбрали {subscription_name}:
-        Начинаю полную обработку..."""
-    ))
+    try:
+        _, statement_id_str, idx_str = callback_query.data.split(":", 2)
+        statement_id = int(statement_id_str)
+        idx = int(idx_str)
+    except (ValueError, IndexError):
+        await callback_query.message.answer("Ошибка: некорректные данные кнопки.")
+        return
 
+    # Достаём выписку из БД
+    statement = await get_statement(statement_id)
+    if statement is None:
+        await callback_query.message.answer(
+            "Не удалось найти данные вашей выписки. Похоже, она устарела — пришлите PDF заново."
+        )
+        return
+
+    names = statement['names']
+    if idx < 0 or idx >= len(names):
+        await callback_query.message.answer("Ошибка: подписка не найдена.")
+        return
+
+    subscription_name = names[idx]
+    records = statement['records']
+
+    processing_msg = await callback_query.message.answer(
+        f"🔍 Анализирую подписку «{subscription_name}»..."
+    )
+
+    # Загружаем специализированный промпт и подставляем имя подписки
+    with open('prompt_subscription.txt', 'r', encoding='utf-8') as f:
+        prompt_template = f.read()
+
+    prompt = prompt_template.replace("{SUBSCRIPTION_NAME}", subscription_name)
+
+    transactions_json = json.dumps(records, ensure_ascii=False, indent=2)
+
+    messages = [
+        {'role': 'system', 'content': prompt},
+        {'role': 'user', 'content': transactions_json}
+    ]
+
+    logging.info("Subscription request for '%s' (statement_id=%s):\n%s",
+                  subscription_name, statement_id, transactions_json)
+
+    # answer = await TextAI.from_text(messages=messages, model='gpt-5.6-terra')
+
+    # try:
+    #     await processing_msg.delete()
+    # except Exception:
+    #     pass
+
+    # if answer.error_text:
+    #     await callback_query.message.answer(f"ОШИБКА: {answer.error_text}")
+    #     return
+
+    # answer_text = answer.answer
+    # logging.info("Subscription answer for '%s':\n%s", subscription_name, answer_text)
+
+    answer = await TextAI.from_text(messages=messages, model='gpt-5.6-terra')
+
+    try:
+        await processing_msg.delete()
+    except Exception:
+        pass
+
+    if answer.error_text:
+        await callback_query.message.answer(f"ОШИБКА: {answer.error_text}")
+        return
+
+    answer_text = answer.answer
+    logging.info("Subscription answer for '%s':\n%s", subscription_name, answer_text)
+
+
+    try:
+        await bot.send_rich_message(
+            chat_id=callback_query.message.chat.id,
+            rich_message=types.InputRichMessage(markdown=answer_text)
+        )
+    except Exception:
+        await bot.send_rich_message(
+            chat_id=callback_query.message.chat.id,
+            rich_message=types.InputRichMessage(html=answer_text)
+        )
 
 
 @dp.shutdown()
 async def on_shutdown():
-    pass
+    await close_pool()
 
 
 if __name__ == '__main__':
