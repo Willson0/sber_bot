@@ -160,7 +160,110 @@ def cluster_transactions(records: list[dict]) -> list[dict]:
     clusters.sort(key=lambda c: c['occurrences'], reverse=True)
     return clusters
 
+import statistics
+from datetime import datetime
+
+def compute_regularity_signals(transactions: list[dict]) -> dict:
+    """
+    Считает объективные признаки того, что кластер — это подписка:
+    - регулярность интервалов между списаниями (примерно месяц)
+    - стабильность суммы (мало отличается от месяца к месяцу)
+    """
+    if len(transactions) < 2:
+        return {
+            "is_periodic": False,
+            "avg_interval_days": None,
+            "interval_std_days": None,
+            "amount_std_ratio": None,
+        }
+
+    dates = sorted(
+        datetime.strptime(t["date"], "%d.%m.%Y") for t in transactions
+    )
+    intervals = [
+        (dates[i + 1] - dates[i]).days for i in range(len(dates) - 1)
+    ]
+    avg_interval = statistics.mean(intervals)
+    interval_std = statistics.pstdev(intervals) if len(intervals) > 1 else 0
+
+    amounts = [abs(t["amount"]) for t in transactions]
+    avg_amount = statistics.mean(amounts)
+    amount_std = statistics.pstdev(amounts) if len(amounts) > 1 else 0
+    amount_std_ratio = amount_std / avg_amount if avg_amount else None
+
+    # "похоже на месячную подписку", если интервал 20-40 дней
+    # и разброс интервалов небольшой (< 10 дней), сумма стабильна (< 15% разброса)
+    is_periodic = (
+        20 <= avg_interval <= 40
+        and interval_std < 10
+        and (amount_std_ratio is None or amount_std_ratio < 0.15)
+    )
+
+    return {
+        "is_periodic": is_periodic,
+        "avg_interval_days": round(avg_interval, 1),
+        "interval_std_days": round(interval_std, 1),
+        "amount_std_ratio": round(amount_std_ratio, 3) if amount_std_ratio is not None else None,
+    }
+
+def compute_periodicity(transactions: list[dict]) -> dict:
+    dates = []
+    for t in transactions:
+        try:
+            dates.append(datetime.strptime(t['date'], '%d.%m.%Y'))
+        except (ValueError, KeyError):
+            continue
+    dates.sort()
+
+    if len(dates) < 2:
+        return {"avg_interval_days": None, "is_monthly_like": False}
+
+    intervals = [(dates[i+1] - dates[i]).days for i in range(len(dates) - 1)]
+    avg_interval = sum(intervals) / len(intervals)
+
+    # допускаем разброс: подписки не всегда списываются в один день
+    is_monthly_like = 20 <= avg_interval <= 40
+
+    return {
+        "avg_interval_days": round(avg_interval, 1),
+        "is_monthly_like": is_monthly_like,
+    }
+
 
 def build_llm_payload(records: list[dict]) -> list[dict]:
     """Точка входа для main.py"""
-    return cluster_transactions(records)
+    clusters = cluster_transactions(records)  # ваша текущая логика
+
+    for cluster in clusters:
+        signals = compute_regularity_signals(cluster["transactions"])
+        cluster.update(signals)
+        cluster["periodicity"] = compute_periodicity(cluster["transactions"])
+
+    return clusters
+
+
+def find_matching_transactions(records: list[dict], subscription_name: str) -> list[dict]:
+    """
+    Находит все транзакции из полной выписки, похожие по названию
+    на уже определённую (LLM) подписку. Используется для построения
+    графика истории списаний конкретного сервиса.
+    """
+    target = normalize_name(subscription_name)
+    matched = []
+
+    for r in records:
+        amount = r.get('amount')
+        if amount is None or amount >= 0:
+            continue
+        if is_excluded(r):
+            continue
+
+        desc_norm = normalize_name(r.get('desc', ''))
+        if not desc_norm:
+            continue
+
+        if _similarity(target, desc_norm) >= NAME_SIMILARITY_THRESHOLD:
+            matched.append(r)
+
+    matched.sort(key=lambda r: _parse_date(r.get('date', '')))
+    return matched

@@ -13,6 +13,9 @@ import json
 from utils import make_subscriptions_keyboard, parse_statement
 from database import init_db, save_statement, get_statement, close_pool
 from llm_helpers import call_llm_with_retry, llm_failed
+from aiogram.types import BufferedInputFile
+from subscription_finder import build_llm_payload, find_matching_transactions
+from chart_generator import generate_subscription_chart
 
 dp = Dispatcher()
 
@@ -111,25 +114,6 @@ async def pdf_handler(message: types.Message):
         await mes.edit_text("Не удалось извлечь транзакции из PDF.")
         return
 
-    # records = [clean_record(r) for r in records]
-    # transactions_json = json.dumps(records, ensure_ascii=False, indent=2)
-
-    # content = f"{transactions_json}"
-
-    # with open('prompt.txt', 'r', encoding='utf-8') as f:
-    #     prompt = f.read()
-
-    # messages = [
-    #     {'role': 'system', 'content': prompt},
-    #     {'role': 'user', 'content': content}
-    # ]
-
-    # logging.info("PDF TEXT:\n%s", transactions_json)
-
-    # answer = await TextAI.from_text(messages=messages, model='gpt-5.6-terra')
-    # if answer.error_text:
-    #     return await message.answer(f"ОШИБКА: {answer.error_text}")
-
     records = [clean_record(r) for r in records]
 
     # ── Детерминированная предобработка: находим кластеры-кандидаты
@@ -166,23 +150,6 @@ async def pdf_handler(message: types.Message):
 
     logging.info("Clusters sent to LLM:\n%s", clusters_json)
 
-    # answer = await TextAI.from_text(messages=messages, model='gpt-5.6-terra')
-    # if answer.error_text:
-    #     return await message.answer(f"ОШИБКА: {answer.error_text}")
-
-
-    # try:
-    #     await mes.delete()
-    # except Exception:
-    #     pass
-
-    # answer_text = answer.answer
-    # logging.info("Answer:\n%s", answer_text)
-    # try:
-    #     data = json.loads(answer_text)
-    # except json.JSONDecodeError as e:
-    #     return await message.answer(f"Ошибка разбора JSON: {e}")
-
     answer = await call_llm_with_retry(TextAI, messages, model='gpt-5.6-terra')
 
     if llm_failed(answer):
@@ -211,19 +178,23 @@ async def pdf_handler(message: types.Message):
             "⚠️ Не удалось обработать ответ сервиса. Попробуйте отправить файл ещё раз."
         )
 
-
     user_message = data['text']
-    names = data['names']
+    subs = data['subscriptions']
 
-    logging.info("Subs:\n%s", names)
+    names = [s['name'] for s in subs]
+    cluster_indices = [s['cluster_index'] for s in subs]
 
-    # Сохраняем выписку и список подписок в БД, получаем id записи
+    logging.info("Subs: %s, cluster_indices: %s", names, cluster_indices)
+
     statement_id = await save_statement(
         user_id=message.from_user.id,
         chat_id=message.chat.id,
         records=records,
         names=names,
+        clusters=clusters,
+        cluster_indices=cluster_indices,
     )
+
 
     keyboard = make_subscriptions_keyboard(names, statement_id)
 
@@ -262,7 +233,6 @@ async def on_subscription_click(callback_query: types.CallbackQuery):
         await callback_query.message.answer("Ошибка: некорректные данные кнопки.")
         return
 
-    # Достаём выписку из БД
     statement = await get_statement(statement_id)
     if statement is None:
         await callback_query.message.answer(
@@ -278,16 +248,38 @@ async def on_subscription_click(callback_query: types.CallbackQuery):
     subscription_name = names[idx]
     records = statement['records']
 
+    # ── Достаём транзакции по явному индексу кластера, без угадывания ──
+    clusters = statement.get('clusters') or []
+    cluster_indices = statement.get('cluster_indices') or []
+
+    matched_transactions = []
+    if idx < len(cluster_indices):
+        real_cluster_idx = cluster_indices[idx]
+        if 0 <= real_cluster_idx < len(clusters):
+            matched_transactions = clusters[real_cluster_idx].get('transactions', [])
+
+    # Фоллбэк для старых записей в БД (сохранённых до этого фикса,
+    # у них просто нет clusters/cluster_indices) — не ломаем старые кнопки.
+    if not matched_transactions:
+        logging.warning(
+            "cluster_indices не дали транзакций для '%s' (idx=%s), "
+            "использую fallback find_matching_transactions",
+            subscription_name, idx,
+        )
+        matched_transactions = find_matching_transactions(records, subscription_name)
+
+    logging.info(
+        "Matched transactions for '%s': %d", subscription_name, len(matched_transactions)
+    )
+
     processing_msg = await callback_query.message.answer(
         f"🔍 Анализирую подписку «{subscription_name}»..."
     )
 
-    # Загружаем специализированный промпт и подставляем имя подписки
     with open('prompt_subscription.txt', 'r', encoding='utf-8') as f:
         prompt_template = f.read()
 
     prompt = prompt_template.replace("{SUBSCRIPTION_NAME}", subscription_name)
-
     transactions_json = json.dumps(records, ensure_ascii=False, indent=2)
 
     messages = [
@@ -295,37 +287,47 @@ async def on_subscription_click(callback_query: types.CallbackQuery):
         {'role': 'user', 'content': transactions_json}
     ]
 
-    logging.info("Subscription request for '%s' (statement_id=%s):\n%s",
-                  subscription_name, statement_id, transactions_json)
-
-    # answer = await TextAI.from_text(messages=messages, model='gpt-5.6-terra')
-
-    # try:
-    #     await processing_msg.delete()
-    # except Exception:
-    #     pass
-
-    # if answer.error_text:
-    #     await callback_query.message.answer(f"ОШИБКА: {answer.error_text}")
-    #     return
-
-    # answer_text = answer.answer
-    # logging.info("Subscription answer for '%s':\n%s", subscription_name, answer_text)
-
-    answer = await TextAI.from_text(messages=messages, model='gpt-5.6-terra')
+    answer = await call_llm_with_retry(TextAI, messages, model='gpt-5.6-terra')
 
     try:
         await processing_msg.delete()
     except Exception:
         pass
 
-    if answer.error_text:
-        await callback_query.message.answer(f"ОШИБКА: {answer.error_text}")
+    if llm_failed(answer):
+        logging.error(
+            "LLM request failed for subscription '%s'. error_text=%r, answer=%r",
+            subscription_name, answer.error_text, answer.answer,
+        )
+        await callback_query.message.answer(
+            "⚠️ Сервис обработки временно перегружен. Попробуйте ещё раз через пару минут."
+        )
         return
 
     answer_text = answer.answer
     logging.info("Subscription answer for '%s':\n%s", subscription_name, answer_text)
 
+    # ── График ──────────────────────────────────────────────────────
+    chart_buf = generate_subscription_chart(matched_transactions, subscription_name)
+
+    if chart_buf:
+        try:
+            await bot.send_photo(
+                chat_id=callback_query.message.chat.id,
+                photo=BufferedInputFile(chart_buf.read(), filename="subscription_chart.png"),
+                caption=f"📊 История списаний: {subscription_name}",
+            )
+        except Exception:
+            logging.exception(
+                "Не удалось отправить график для подписки '%s'", subscription_name
+            )
+    else:
+        # Раньше это молчало и график просто пропадал без следа —
+        # теперь любая будущая регрессия сразу видна в логах.
+        logging.warning(
+            "chart_buf is None для '%s' (matched_transactions=%d)",
+            subscription_name, len(matched_transactions),
+        )
 
     try:
         await bot.send_rich_message(
@@ -337,6 +339,7 @@ async def on_subscription_click(callback_query: types.CallbackQuery):
             chat_id=callback_query.message.chat.id,
             rich_message=types.InputRichMessage(html=answer_text)
         )
+
 
 
 @dp.shutdown()
