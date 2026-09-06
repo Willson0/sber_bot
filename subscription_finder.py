@@ -1,11 +1,3 @@
-"""
-Детерминированная предобработка транзакций: находит потенциальные
-подписки алгоритмически, ДО передачи в LLM.
-
-LLM больше не ищет совпадения в сотнях строк — она получает готовые
-кластеры и только (а) подтверждает/отклоняет их как подписку,
-(б) генерирует текст письма и оформление по шаблону.
-"""
 import re
 from collections import Counter
 from datetime import datetime
@@ -171,7 +163,6 @@ def compute_regularity_signals(transactions: list[dict]) -> dict:
     """
     if len(transactions) < 2:
         return {
-            "is_periodic": False,
             "avg_interval_days": None,
             "interval_std_days": None,
             "amount_std_ratio": None,
@@ -191,43 +182,66 @@ def compute_regularity_signals(transactions: list[dict]) -> dict:
     amount_std = statistics.pstdev(amounts) if len(amounts) > 1 else 0
     amount_std_ratio = amount_std / avg_amount if avg_amount else None
 
-    # "похоже на месячную подписку", если интервал 20-40 дней
-    # и разброс интервалов небольшой (< 10 дней), сумма стабильна (< 15% разброса)
-    is_periodic = (
-        20 <= avg_interval <= 40
-        and interval_std < 10
-        and (amount_std_ratio is None or amount_std_ratio < 0.15)
-    )
-
     return {
-        "is_periodic": is_periodic,
         "avg_interval_days": round(avg_interval, 1),
         "interval_std_days": round(interval_std, 1),
         "amount_std_ratio": round(amount_std_ratio, 3) if amount_std_ratio is not None else None,
     }
 
+from datetime import datetime
+
+
+def _parse_date(date_str: str) -> datetime:
+    return datetime.strptime(date_str, '%d.%m.%Y')
+
+
 def compute_periodicity(transactions: list[dict]) -> dict:
-    dates = []
-    for t in transactions:
-        try:
-            dates.append(datetime.strptime(t['date'], '%d.%m.%Y'))
-        except (ValueError, KeyError):
-            continue
-    dates.sort()
+    result = {
+        "is_periodic": False,
+        "period_type": None,
+        "is_monthly_like": False,
+        "avg_interval_days": None,
+    }
+
+    if len(transactions) < 2:
+        return result
+
+    try:
+        dates = sorted(_parse_date(t["date"]) for t in transactions if t.get("date"))
+    except (ValueError, KeyError):
+        return result
 
     if len(dates) < 2:
-        return {"avg_interval_days": None, "is_monthly_like": False}
+        return result
 
-    intervals = [(dates[i+1] - dates[i]).days for i in range(len(dates) - 1)]
+    intervals = [(dates[i + 1] - dates[i]).days for i in range(len(dates) - 1)]
+
+    # Минимальный интервал в 1 день — отсекаем задвоенные/одноразовые
+    # списания, случайно попавшие в один кластер по названию и сумме.
+    if any(interval < 1 for interval in intervals):
+        return result
+
     avg_interval = sum(intervals) / len(intervals)
+    result["avg_interval_days"] = round(avg_interval, 1)
 
-    # допускаем разброс: подписки не всегда списываются в один день
-    is_monthly_like = 20 <= avg_interval <= 40
+    # (эталонный период в днях, допуск в днях)
+    reference_periods = (
+        ("weekly", 7, 2),
+        ("monthly", 30, 3),
+        ("quarterly", 90, 7),
+        ("yearly", 365, 15),
+    )
 
-    return {
-        "avg_interval_days": round(avg_interval, 1),
-        "is_monthly_like": is_monthly_like,
-    }
+    for period_type, ref_days, tolerance in reference_periods:
+        if abs(avg_interval - ref_days) <= tolerance:
+            # Проверяем КАЖДЫЙ интервал, а не только среднее.
+            if all(abs(interval - ref_days) <= tolerance for interval in intervals):
+                result["is_periodic"] = True
+                result["period_type"] = period_type
+                result["is_monthly_like"] = period_type == "monthly"
+                return result
+
+    return result
 
 
 def build_llm_payload(records: list[dict]) -> list[dict]:

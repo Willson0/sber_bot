@@ -15,7 +15,7 @@ from database import init_db, save_statement, get_statement, close_pool
 from llm_helpers import call_llm_with_retry, llm_failed
 from aiogram.types import BufferedInputFile
 from subscription_finder import build_llm_payload, find_matching_transactions
-from chart_generator import generate_subscription_chart
+from chart_generator import compute_subscription_stats, render_stats_card
 
 dp = Dispatcher()
 
@@ -253,38 +253,38 @@ async def on_subscription_click(callback_query: types.CallbackQuery):
     cluster_indices = statement.get('cluster_indices') or []
 
     matched_transactions = []
+    cluster_period_type = None
     if idx < len(cluster_indices):
         real_cluster_idx = cluster_indices[idx]
         if 0 <= real_cluster_idx < len(clusters):
-            matched_transactions = clusters[real_cluster_idx].get('transactions', [])
+            periodicity = clusters[real_cluster_idx].get('periodicity') or {}
+            cluster_period_type = periodicity.get('period_type')
 
-    # Фоллбэк для старых записей в БД (сохранённых до этого фикса,
-    # у них просто нет clusters/cluster_indices) — не ломаем старые кнопки.
-    if not matched_transactions:
-        logging.warning(
-            "cluster_indices не дали транзакций для '%s' (idx=%s), "
-            "использую fallback find_matching_transactions",
-            subscription_name, idx,
+    stats = compute_subscription_stats(matched_transactions, cluster_period_type)
+
+    if stats is None:
+        await callback_query.message.answer(
+            f"⚠️ Не удалось посчитать статистику по «{subscription_name}» — "
+            f"недостаточно данных в выписке."
         )
-        matched_transactions = find_matching_transactions(records, subscription_name)
+        return
 
-    logging.info(
-        "Matched transactions for '%s': %d", subscription_name, len(matched_transactions)
-    )
+    stats_card = render_stats_card(subscription_name, stats)
 
     processing_msg = await callback_query.message.answer(
-        f"🔍 Анализирую подписку «{subscription_name}»..."
+        f"🔍 Готовлю письмо в поддержку «{subscription_name}»..."
     )
 
     with open('prompt_subscription.txt', 'r', encoding='utf-8') as f:
         prompt_template = f.read()
 
     prompt = prompt_template.replace("{SUBSCRIPTION_NAME}", subscription_name)
-    transactions_json = json.dumps(records, ensure_ascii=False, indent=2)
 
+    # LLM теперь получает ТОЛЬКО задачу написать письмо — никаких чисел,
+    # значит и ошибиться в арифметике негде.
     messages = [
         {'role': 'system', 'content': prompt},
-        {'role': 'user', 'content': transactions_json}
+        {'role': 'user', 'content': f"Напиши письмо для отмены подписки на {subscription_name}"},
     ]
 
     answer = await call_llm_with_retry(TextAI, messages, model='gpt-5.6-terra')
@@ -299,45 +299,25 @@ async def on_subscription_click(callback_query: types.CallbackQuery):
             "LLM request failed for subscription '%s'. error_text=%r, answer=%r",
             subscription_name, answer.error_text, answer.answer,
         )
-        await callback_query.message.answer(
-            "⚠️ Сервис обработки временно перегружен. Попробуйте ещё раз через пару минут."
-        )
-        return
-
-    answer_text = answer.answer
-    logging.info("Subscription answer for '%s':\n%s", subscription_name, answer_text)
-
-    # ── График ──────────────────────────────────────────────────────
-    chart_buf = generate_subscription_chart(matched_transactions, subscription_name)
-
-    if chart_buf:
-        try:
-            await bot.send_photo(
-                chat_id=callback_query.message.chat.id,
-                photo=BufferedInputFile(chart_buf.read(), filename="subscription_chart.png"),
-                caption=f"📊 История списаний: {subscription_name}",
-            )
-        except Exception:
-            logging.exception(
-                "Не удалось отправить график для подписки '%s'", subscription_name
-            )
+        letter_text = "⚠️ Не удалось сгенерировать письмо. Попробуйте позже."
     else:
-        # Раньше это молчало и график просто пропадал без следа —
-        # теперь любая будущая регрессия сразу видна в логах.
-        logging.warning(
-            "chart_buf is None для '%s' (matched_transactions=%d)",
-            subscription_name, len(matched_transactions),
-        )
+        letter_text = answer.answer.strip()
+
+    final_message = (
+        f"{stats_card}\n\n"
+        f"✉️ **Письмо в поддержку {subscription_name}**\n\n"
+        f"> {letter_text}"
+    )
 
     try:
         await bot.send_rich_message(
             chat_id=callback_query.message.chat.id,
-            rich_message=types.InputRichMessage(markdown=answer_text)
+            rich_message=types.InputRichMessage(markdown=final_message)
         )
     except Exception:
         await bot.send_rich_message(
             chat_id=callback_query.message.chat.id,
-            rich_message=types.InputRichMessage(html=answer_text)
+            rich_message=types.InputRichMessage(html=final_message)
         )
 
 
