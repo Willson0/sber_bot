@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Аналитика подписок</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/vue/3.4.21/vue.global.prod.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0F1419; --surface:#1A2027; --surface-2:#232C35;
+    --text:#E6EAEE; --muted:#8A94A0; --line:#2C363F;
+    --accent:#4ECDC4; --warn:#F2994A;
+    --c1:#4ECDC4; --c2:#4E9FCD; --c3:#6C7BE0; --c4:#9B6CE0; --c5:#E06CB4; --c6:#E0A96C;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased;font-feature-settings:"tnum" 1;}
+  body{padding:20px 16px calc(28px + env(safe-area-inset-bottom));max-width:640px;margin:0 auto;}
+  .num{font-variant-numeric:tabular-nums;}
+  @media (prefers-reduced-motion: reduce){*{transition:none!important;animation:none!important;}}
+
+  /* ---------- hero ---------- */
+  .hero{margin-bottom:24px;}
+  .hero__label{color:var(--muted);font-size:14px;font-weight:500;margin-bottom:6px;}
+  .hero__amount{font-size:52px;font-weight:700;line-height:1;letter-spacing:-1.5px;}
+  .hero__amount .cur{font-size:26px;font-weight:600;color:var(--muted);margin-left:4px;}
+  .hero__sub{color:var(--muted);font-size:15px;margin-top:10px;}
+  .hero__sub b{color:var(--text);font-weight:600;}
+
+  /* ---------- stat row ---------- */
+  .stats{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:24px;}
+  .stat{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:14px 12px;}
+  .stat__v{font-size:20px;font-weight:700;}
+  .stat__k{color:var(--muted);font-size:12px;margin-top:4px;line-height:1.3;}
+
+  /* ---------- card ---------- */
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:18px;padding:18px;margin-bottom:16px;}
+  .card__title{font-size:15px;font-weight:600;margin-bottom:14px;color:var(--text);}
+  .chart-wrap{position:relative;height:220px;}
+
+  /* ---------- subscription list ---------- */
+  .sub{display:flex;align-items:center;gap:12px;padding:14px 0;border-top:1px solid var(--line);}
+  .sub:first-child{border-top:none;}
+  .dot{width:10px;height:10px;border-radius:50%;flex:0 0 auto;}
+  .sub__main{flex:1;min-width:0;}
+  .sub__name{font-weight:600;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .sub__meta{color:var(--muted);font-size:13px;margin-top:2px;}
+  .sub__amt{text-align:right;flex:0 0 auto;}
+  .sub__amt .y{font-weight:700;font-size:15px;}
+  .sub__amt .m{color:var(--muted);font-size:12px;margin-top:2px;}
+  .trend{display:inline-block;font-size:12px;font-weight:600;padding:1px 7px;border-radius:999px;margin-left:6px;}
+  .trend.up{color:var(--warn);background:rgba(242,153,74,.14);}
+  .trend.down{color:var(--accent);background:rgba(78,205,196,.14);}
+
+  /* ---------- states ---------- */
+  .state{min-height:60vh;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    text-align:center;gap:14px;color:var(--muted);padding:0 24px;}
+  .spinner{width:34px;height:34px;border:3px solid var(--line);border-top-color:var(--accent);
+    border-radius:50%;animation:spin .8s linear infinite;}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .state h2{color:var(--text);font-size:18px;font-weight:600;}
+  .state p{font-size:14px;line-height:1.5;max-width:320px;}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- loading -->
+  <div v-if="status==='loading'" class="state">
+    <div class="spinner"></div>
+    <p>Собираю аналитику…</p>
+  </div>
+
+  <!-- error -->
+  <div v-else-if="status==='error'" class="state">
+    <h2>Не получилось открыть аналитику</h2>
+    <p>{{ errorMsg }}</p>
+  </div>
+
+  <!-- empty -->
+  <div v-else-if="status==='empty'" class="state">
+    <h2>Активных подписок не найдено</h2>
+    <p>В этой выписке не оказалось регулярных списаний, похожих на подписки.</p>
+  </div>
+
+  <!-- content -->
+  <template v-else>
+    <div class="hero">
+      <div class="hero__label">Тратите на подписки за год</div>
+      <div class="hero__amount num">{{ fmt(animatedYear) }}<span class="cur">₽</span></div>
+      <div class="hero__sub">
+        Это примерно <b class="num">{{ fmt(data.summary.total_monthly) }} ₽</b> в месяц
+      </div>
+    </div>
+
+    <div class="stats">
+      <div class="stat">
+        <div class="stat__v num">{{ data.summary.subscriptions_count }}</div>
+        <div class="stat__k">активных подписок</div>
+      </div>
+      <div class="stat">
+        <div class="stat__v num">{{ fmt(data.summary.total_monthly) }}</div>
+        <div class="stat__k">₽ в месяц</div>
+      </div>
+      <div class="stat">
+        <div class="stat__v num">{{ data.summary.transactions_count }}</div>
+        <div class="stat__k">операций в выписке</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card__title">Куда уходят деньги за год</div>
+      <div class="chart-wrap"><canvas ref="pie"></canvas></div>
+    </div>
+
+    <div class="card" v-if="data.monthly_timeline.length > 1">
+      <div class="card__title">Траты на подписки по месяцам</div>
+      <div class="chart-wrap"><canvas ref="line"></canvas></div>
+    </div>
+
+    <div class="card">
+      <div class="card__title">Подписки — от самых дорогих</div>
+      <div class="sub" v-for="(s,i) in data.subscriptions" :key="s.name">
+        <span class="dot" :style="{background: palette[i % palette.length]}"></span>
+        <div class="sub__main">
+          <div class="sub__name">
+            {{ s.name }}
+            <span v-if="s.trend==='up'" class="trend up">↑ {{ s.trend_pct }}%</span>
+            <span v-else-if="s.trend==='down'" class="trend down">↓ {{ Math.abs(s.trend_pct) }}%</span>
+          </div>
+          <div class="sub__meta num">
+            {{ s.count }} {{ plural(s.count,'списание','списания','списаний') }} ·
+            {{ periodLabel(s.period_type) }} · ~{{ fmt(s.avg_amount) }} ₽/раз
+          </div>
+        </div>
+        <div class="sub__amt">
+          <div class="y num">{{ fmt(s.total_12m) }} ₽</div>
+          <div class="m num">{{ fmt(s.monthly_estimate) }} ₽/мес</div>
+        </div>
+      </div>
+    </div>
+  </template>
+</div>
+
+<script>
+const { createApp } = Vue;
+
+createApp({
+  data(){
+    return {
+      status:'loading',
+      errorMsg:'',
+      data:null,
+      animatedYear:0,
+      palette:['#4ECDC4','#4E9FCD','#6C7BE0','#9B6CE0','#E06CB4','#E0A96C'],
+    };
+  },
+  async mounted(){
+    const tg = window.Telegram?.WebApp;
+    tg?.ready(); tg?.expand();
+
+    // statement_id приходит в URL: ?sid=123  (бот подставляет его в WebAppInfo.url)
+    const sid = new URLSearchParams(location.search).get('sid');
+    const initData = tg?.initData || '';
+
+    if(!sid){ this.fail('Не передан идентификатор выписки.'); return; }
+    if(!initData){ this.fail('Откройте аналитику через кнопку в Telegram-боте.'); return; }
+
+    try{
+      const res = await fetch(`/api/analytics/${encodeURIComponent(sid)}`, {
+        headers: { 'X-Init-Data': initData }
+      });
+      if(res.status === 401 || res.status === 403){ this.fail('Нет доступа к этой выписке.'); return; }
+      if(res.status === 404){ this.fail('Выписка не найдена — возможно, устарела. Пришлите файл боту заново.'); return; }
+      if(!res.ok){ this.fail('Сервер вернул ошибку. Попробуйте позже.'); return; }
+
+      const data = await res.json();
+      this.data = data;
+
+      if(!data.subscriptions || data.subscriptions.length === 0){ this.status='empty'; return; }
+
+      this.status='ready';
+      await this.$nextTick();
+      this.countUp(data.summary.total_12m);
+      this.drawPie();
+      if(data.monthly_timeline.length > 1) this.drawLine();
+    }catch(e){
+      this.fail('Не удалось связаться с сервером.');
+    }
+  },
+  methods:{
+    fail(msg){ this.errorMsg = msg; this.status='error'; },
+    fmt(v){ return Math.round(v).toLocaleString('ru-RU'); },
+    plural(n, one, few, many){
+      const m10=n%10, m100=n%100;
+      if(m10===1 && m100!==11) return one;
+      if(m10>=2 && m10<=4 && (m100<10||m100>=20)) return few;
+      return many;
+    },
+    periodLabel(p){
+      return {weekly:'еженедельно',monthly:'ежемесячно',quarterly:'ежеквартально',yearly:'ежегодно'}[p] || 'нерегулярно';
+    },
+    countUp(target){
+      if(window.matchMedia('(prefers-reduced-motion: reduce)').matches){ this.animatedYear=target; return; }
+      const dur=900, start=performance.now();
+      const step=(now)=>{
+        const t=Math.min(1,(now-start)/dur);
+        const eased=1-Math.pow(1-t,3); // ease-out cubic
+        this.animatedYear=target*eased;
+        if(t<1) requestAnimationFrame(step); else this.animatedYear=target;
+      };
+      requestAnimationFrame(step);
+    },
+    drawPie(){
+      const subs=this.data.subscriptions;
+      new Chart(this.$refs.pie, {
+        type:'doughnut',
+        data:{
+          labels:subs.map(s=>s.name),
+          datasets:[{
+            data:subs.map(s=>s.total_12m),
+            backgroundColor:subs.map((_,i)=>this.palette[i%this.palette.length]),
+            borderColor:'#1A2027', borderWidth:3, hoverOffset:6,
+          }]
+        },
+        options:{
+          responsive:true, maintainAspectRatio:false, cutout:'62%',
+          plugins:{
+            legend:{position:'bottom',
+              labels:{color:'#8A94A0',boxWidth:10,boxHeight:10,padding:14,font:{family:'Inter',size:12}}},
+            tooltip:{callbacks:{label:(c)=>` ${c.label}: ${Math.round(c.parsed).toLocaleString('ru-RU')} ₽/год`}}
+          }
+        }
+      });
+    },
+    drawLine(){
+      const tl=this.data.monthly_timeline;
+      const labels=tl.map(p=>{
+        const [y,m]=p.month.split('-');
+        return ['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек'][+m-1]+' '+y.slice(2);
+      });
+      new Chart(this.$refs.line,{
+        type:'line',
+        data:{labels,datasets:[{
+          data:tl.map(p=>p.amount),
+          borderColor:'#4ECDC4',borderWidth:2,
+          backgroundColor:'rgba(78,205,196,.12)',fill:true,
+          tension:.35,pointRadius:3,pointBackgroundColor:'#4ECDC4',
+        }]},
+        options:{
+          responsive:true,maintainAspectRatio:false,
+          plugins:{legend:{display:false},
+            tooltip:{callbacks:{label:(c)=>` ${Math.round(c.parsed.y).toLocaleString('ru-RU')} ₽`}}},
+          scales:{
+            x:{grid:{color:'#2C363F'},ticks:{color:'#8A94A0',font:{size:11}}},
+            y:{grid:{color:'#2C363F'},ticks:{color:'#8A94A0',font:{size:11},
+              callback:(v)=>v.toLocaleString('ru-RU')},beginAtZero:true}
+          }
+        }
+      });
+    }
+  }
+}).mount('#app');
+</script>
+</body>
+</html>
