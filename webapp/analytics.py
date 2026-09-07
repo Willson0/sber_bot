@@ -24,7 +24,20 @@ def _parse_date(d: str):
         return None
 
 
-
+def _period_type_for(name_idx: int, clusters: list, cluster_indices: list):
+    """
+    period_type ('monthly'/'weekly'/...) берём из кластера ЭТОЙ подписки —
+    по её собственному индексу name_idx, а не из первого попавшегося кластера.
+    Иначе месячной подписке мог достаться period_type соседней (например
+    weekly), и месячный прогноз завышался бы в ~4 раза.
+    Если не нашли — None (chart_generator тогда берёт monthly, множитель 1).
+    """
+    if 0 <= name_idx < len(cluster_indices):
+        ci = cluster_indices[name_idx]
+        if 0 <= ci < len(clusters):
+            per = clusters[ci].get("periodicity") or {}
+            return per.get("period_type")
+    return None
 
 
 def _transactions_for(name_idx, name, records, clusters, cluster_indices):
@@ -46,21 +59,12 @@ def _transactions_for(name_idx, name, records, clusters, cluster_indices):
     return find_matching_transactions(records, name)
 
 
-def _period_type_for(cluster_idx: int | None, clusters: list):
-    """
-    Периодичность берём из ОДНОГО кластера — того, что LLM сопоставила
-    именно этой подписке. Иначе (как было раньше) периодичность одной
-    подписки может "утечь" в расчёты для другой.
-    """
-    if cluster_idx is None:
-        return None
-    if 0 <= cluster_idx < len(clusters):
-        per = clusters[cluster_idx].get("periodicity") or {}
-        return per.get("period_type")
-    return None
-
-
 def build_analytics(statement: dict) -> dict:
+    """
+    statement — строка из БД, уже с распарсенными records/names/clusters
+    (см. database.get_statement).
+    Возвращает JSON-совместимый dict для фронта.
+    """
     records = statement.get("records", []) or []
     names = statement.get("names", []) or []
     clusters = statement.get("clusters", []) or []
@@ -72,10 +76,7 @@ def build_analytics(statement: dict) -> dict:
 
     for name_idx, name in enumerate(names):
         matched = _transactions_for(name_idx, name, records, clusters, cluster_indices)
-
-        ci = cluster_indices[name_idx] if name_idx < len(cluster_indices) else None
-        period_type = _period_type_for(ci, clusters)
-
+        period_type = _period_type_for(name_idx, clusters, cluster_indices)
         stats = compute_subscription_stats(matched, period_type)
         if stats is None:
             continue
@@ -103,9 +104,11 @@ def build_analytics(statement: dict) -> dict:
             "history": history,
         })
 
+    # Сортируем по годовым тратам — самые дорогие подписки первыми.
     subscriptions.sort(key=lambda s: s["total_12m"], reverse=True)
 
-    monthly_map = {}
+    # Помесячные суммарные траты по всем подпискам (для линейного графика).
+    monthly_map = {}  # 'YYYY-MM' -> сумма
     for sub in subscriptions:
         for h in sub["history"]:
             dt = _parse_date(h["date"])
