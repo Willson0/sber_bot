@@ -42,7 +42,7 @@ import io
 #         )])
 #     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
-WEBAPP_URL = "https://later.com"
+WEBAPP_URL = "https://path-march-inflation-republic.trycloudflare.com"
 
 def make_subscriptions_keyboard(names: list[str], statement_id: int):
     builder = InlineKeyboardBuilder()
@@ -54,7 +54,7 @@ def make_subscriptions_keyboard(names: list[str], statement_id: int):
     # Кнопка веб-аппа — отдельная, не участвует в раскладке "по 2 в строке"
     builder.button(
         text="📊 Открыть полную аналитику",
-        web_app=WebAppInfo(url=WEBAPP_URL),
+        web_app=WebAppInfo(url=f"{WEBAPP_URL}/?sid={statement_id}"),
     )
 
     # Раскладка: сначала N кнопок подписок по 2 в строке,

@@ -86,11 +86,114 @@ def clean_record(r: dict) -> dict:
 
 
 @dp.message(F.document)
+async def document_handler(message: types.Message):
+    """
+    Единая точка входа для файлов. PDF идёт по основному пути
+    (парсер банка → кластеризация → LLM). CSV идёт по УПРОЩЁННОМУ
+    тестовому пути (сырые строки → LLM, без кластеризации).
+    """
+    name = (message.document.file_name or '').lower()
+    if name.endswith('.csv'):
+        await csv_handler(message)
+        return
+    if name.endswith('.pdf'):
+        await pdf_handler(message)
+        return
+    await message.reply("Пожалуйста, отправьте файл формата .pdf или .csv")
+
+
+async def csv_handler(message: types.Message):
+    """
+    ТЕСТОВЫЙ режим для CSV. Специально обходит build_llm_payload:
+    файл просто бьётся на непустые строки и целиком уходит нейросети,
+    которая сама выбирает подписки. Кластеры и алгоритм периодичности
+    здесь НЕ участвуют — структура намного проще.
+    """
+    document = message.document
+    mes = await message.answer("Обрабатываю CSV (тестовый режим)...")
+
+    file = await bot.get_file(document.file_id)
+    file_bytes = await bot.download_file(file.file_path)
+    raw = file_bytes if isinstance(file_bytes, bytes) else file_bytes.read()
+
+    # Декодируем терпимо к кодировкам (Сбер/Эксель часто отдают cp1251).
+    for enc in ('utf-8-sig', 'utf-8', 'cp1251'):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        await mes.edit_text("Не удалось прочитать CSV: неизвестная кодировка.")
+        return
+
+    # Просто разбиваем на строки — никакого парсинга по колонкам.
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        await mes.edit_text("CSV пустой — не из чего искать подписки.")
+        return
+
+    logging.info("CSV mode: %d non-empty lines", len(lines))
+
+    with open('prompt_csv.txt', 'r', encoding='utf-8') as f:
+        prompt = f.read()
+
+    # Отдаём нейросети сырые строки целиком.
+    messages = [
+        {'role': 'system', 'content': prompt},
+        {'role': 'user', 'content': '\n'.join(lines)},
+    ]
+
+    answer = await call_llm_with_retry(TextAI, messages, model='gpt-5.6-terra')
+
+    if llm_failed(answer):
+        logging.error("CSV LLM failed. error_text=%r", answer.error_text)
+        await mes.edit_text(
+            "⚠️ Сервис обработки временно перегружен. Попробуйте ещё раз через пару минут."
+        )
+        return
+
+    try:
+        await mes.delete()
+    except Exception:
+        pass
+
+    try:
+        data = json.loads(answer.answer)
+    except json.JSONDecodeError:
+        logging.error("CSV JSON decode failed. Raw: %s", answer.answer)
+        await message.answer("⚠️ Не удалось обработать ответ сервиса. Попробуйте ещё раз.")
+        return
+
+    user_message = data.get('text', 'Готово.')
+    subs = data.get('subscriptions', [])
+    names = [s['name'] for s in subs]
+
+    # В CSV-режиме кластеров нет. Чтобы кнопки подписок и веб-аналитика
+    # продолжали работать, сохраняем сами строки как "плоские" записи,
+    # а имена подписок — как есть. clusters/cluster_indices оставляем
+    # пустыми: аналитика тогда упадёт на fallback find_matching_transactions.
+    pseudo_records = [{'date': None, 'amount': None, 'desc': ln, 'category': ''} for ln in lines]
+
+    statement_id = await save_statement(
+        user_id=message.from_user.id,
+        chat_id=message.chat.id,
+        records=pseudo_records,
+        names=names,
+        clusters=[],
+        cluster_indices=[],
+    )
+
+    keyboard = make_subscriptions_keyboard(names, statement_id)
+    await bot.send_rich_message(
+        chat_id=message.chat.id,
+        rich_message=types.InputRichMessage(markdown=user_message),
+        reply_markup=keyboard,
+    )
+
+
 async def pdf_handler(message: types.Message):
     document = message.document
-    if not document.file_name.lower().endswith('.pdf'):
-        await message.reply("Пожалуйста, отправьте файл формата .pdf")
-        return
 
     mes = await message.answer("Генерирую ответ по вашему PDF...")
 
