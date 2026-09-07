@@ -248,46 +248,13 @@ async def on_subscription_click(callback_query: types.CallbackQuery):
     subscription_name = names[idx]
     records = statement['records']
 
-    # ── Достаём транзакции по явному индексу кластера, без угадывания ──
-    clusters = statement.get('clusters') or []
-    cluster_indices = statement.get('cluster_indices') or []
-
-    matched_transactions = []
-    cluster_period_type = None
-    if idx < len(cluster_indices):
-        real_cluster_idx = cluster_indices[idx]
-        if 0 <= real_cluster_idx < len(clusters):
-            matched_transactions = clusters[real_cluster_idx].get('transactions', [])
-            periodicity = clusters[real_cluster_idx].get('periodicity') or {}
-            cluster_period_type = periodicity.get('period_type')
-
-    # Фоллбэк для старых записей в БД (сохранённых до этого фикса,
-    # у них просто нет clusters/cluster_indices) — не ломаем старые кнопки.
-    if not matched_transactions:
-        logging.warning(
-            "cluster_indices не дали транзакций для '%s' (idx=%s), "
-            "использую fallback find_matching_transactions",
-            subscription_name, idx,
-        )
-        matched_transactions = find_matching_transactions(records, subscription_name)
-
     logging.info(
-        "Matched transactions for '%s': %d", subscription_name, len(matched_transactions)
+        "Analyzing subscription '%s' with full statement (%d records)",
+        subscription_name, len(records),
     )
 
-    stats = compute_subscription_stats(matched_transactions, cluster_period_type)
-
-    if stats is None:
-        await callback_query.message.answer(
-            f"⚠️ Не удалось посчитать статистику по «{subscription_name}» — "
-            f"недостаточно данных в выписке."
-        )
-        return
-
-    stats_card = render_stats_card(subscription_name, stats)
-
     processing_msg = await callback_query.message.answer(
-        f"🔍 Готовлю письмо в поддержку «{subscription_name}»..."
+        f"🔍 Анализирую подписку «{subscription_name}»..."
     )
 
     with open('prompt_subscription.txt', 'r', encoding='utf-8') as f:
@@ -295,9 +262,13 @@ async def on_subscription_click(callback_query: types.CallbackQuery):
 
     prompt = prompt_template.replace("{SUBSCRIPTION_NAME}", subscription_name)
 
+    # ── От лица user отправляем ВСЮ выписку (все записи из PDF),
+    # LLM сама находит нужные транзакции и анализирует. ──
+    transactions_json = json.dumps(records, ensure_ascii=False, indent=2)
+
     messages = [
         {'role': 'system', 'content': prompt},
-        {'role': 'user', 'content': f"Напиши письмо для отмены подписки на {subscription_name}"},
+        {'role': 'user', 'content': transactions_json},
     ]
 
     answer = await call_llm_with_retry(TextAI, messages, model='gpt-5.6-terra')
@@ -312,26 +283,25 @@ async def on_subscription_click(callback_query: types.CallbackQuery):
             "LLM request failed for subscription '%s'. error_text=%r, answer=%r",
             subscription_name, answer.error_text, answer.answer,
         )
-        letter_text = "⚠️ Не удалось сгенерировать письмо. Попробуйте позже."
-    else:
-        letter_text = answer.answer.strip()
+        await callback_query.message.answer(
+            "⚠️ Сервис обработки временно перегружен. Попробуйте ещё раз через пару минут."
+        )
+        return
 
-    final_message = (
-        f"{stats_card}\n\n"
-        f"✉️ **Письмо в поддержку {subscription_name}**\n\n"
-        f"> {letter_text}"
-    )
+    answer_text = answer.answer
+    logging.info("Subscription analysis for '%s':\n%s", subscription_name, answer_text)
 
     try:
         await bot.send_rich_message(
             chat_id=callback_query.message.chat.id,
-            rich_message=types.InputRichMessage(markdown=final_message)
+            rich_message=types.InputRichMessage(markdown=answer_text)
         )
     except Exception:
         await bot.send_rich_message(
             chat_id=callback_query.message.chat.id,
-            rich_message=types.InputRichMessage(html=final_message)
+            rich_message=types.InputRichMessage(html=answer_text)
         )
+
 
 
 
